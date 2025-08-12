@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
-import { doc, getDoc, collection, addDoc, getDocs, query, orderBy, updateDoc, increment } from "firebase/firestore";
+import { doc, getDoc, collection, addDoc, getDocs, query, orderBy, updateDoc, increment, setDoc, getDoc as getDocRef } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,7 +15,10 @@ import {
   Users,
   Lock,
   Plus,
-  Image as ImageIcon
+  Image as ImageIcon,
+  ZoomIn,
+  ThumbsUp,
+  ThumbsDown
 } from "lucide-react";
 
 interface RoomData {
@@ -28,10 +31,13 @@ interface RoomData {
 
 interface Photo {
   id: string;
-  base64: string; // Store image as base64 string
+  base64: string;
   name: string;
   uploadedAt: Date;
   uploader?: string;
+  likeCount: number;
+  dislikeCount: number;
+  userAction?: string; // "like", "dislike", or undefined
 }
 
 const Room = () => {
@@ -44,6 +50,10 @@ const Room = () => {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [selectedPhoto, setSelectedPhoto] = useState<Photo | null>(null);
+  
+  // Mock user ID (replace with Firebase Auth in production)
+  const userId = "mock-user-123";
 
   useEffect(() => {
     if (roomId) {
@@ -68,8 +78,8 @@ const Room = () => {
       const data = roomDoc.data();
       const room: RoomData = {
         id: roomDoc.id,
-        name: data.name,
-        isPrivate: data.isPrivate,
+        name: data.name || "Unnamed Room",
+        isPrivate: data.isPrivate || false,
         password: data.password,
         photoCount: data.photoCount || 0
       };
@@ -104,6 +114,7 @@ const Room = () => {
 
   const loadPhotos = async () => {
     try {
+      console.log("Loading photos for room:", roomId);
       const q = query(
         collection(db, "rooms", roomId!, "photos"), 
         orderBy("uploadedAt", "desc")
@@ -111,20 +122,55 @@ const Room = () => {
       const querySnapshot = await getDocs(q);
       const photosList: Photo[] = [];
       
-      querySnapshot.forEach((doc) => {
+      for (const doc of querySnapshot.docs) {
         const data = doc.data();
+        console.log("Photo data:", data);
+        
+        // Skip invalid documents
+        if (!data.base64 || !data.name || !data.uploadedAt) {
+          console.warn(`Skipping photo ${doc.id} due to missing required fields`);
+          continue;
+        }
+
+        // Handle potentially missing or invalid timestamp
+        let uploadedAt: Date;
+        try {
+          uploadedAt = data.uploadedAt.toDate();
+        } catch (error) {
+          console.warn(`Invalid timestamp for photo ${doc.id}, using current date`);
+          uploadedAt = new Date();
+        }
+
+        // Fetch user-specific like/dislike
+        let userAction: string | undefined;
+        try {
+          const likeDoc = await getDocRef(doc(db, "rooms", roomId!, "photos", doc.id, "likes", userId));
+          userAction = likeDoc.exists() ? likeDoc.data().action : undefined;
+        } catch (error) {
+          console.warn(`Failed to fetch like data for photo ${doc.id}:`, error);
+        }
+
         photosList.push({
           id: doc.id,
           base64: data.base64,
           name: data.name,
-          uploadedAt: data.uploadedAt.toDate(),
-          uploader: data.uploader
+          uploadedAt,
+          uploader: data.uploader || "Anonymous",
+          likeCount: data.likeCount || 0,
+          dislikeCount: data.dislikeCount || 0,
+          userAction
         });
-      });
+      }
       
+      console.log("Loaded photos:", photosList);
       setPhotos(photosList);
     } catch (error) {
       console.error("Error loading photos:", error);
+      toast({
+        title: "Error",
+        description: "Failed to load photos. Please try again.",
+        variant: "destructive"
+      });
     }
   };
 
@@ -137,7 +183,7 @@ const Room = () => {
 
     Array.from(files).forEach((file) => {
       if (file.type.startsWith("image/")) {
-        if (file.size > 750 * 1024) { // Check file size < 750KB to ensure base64 fits in 1MB
+        if (file.size > 750 * 1024) {
           toast({
             title: "File too large",
             description: `${file.name} exceeds 750KB limit for Firestore storage.`,
@@ -187,7 +233,9 @@ const Room = () => {
             base64,
             name: file.name,
             uploadedAt: new Date(),
-            uploader: "Anonymous" // Update with auth later if needed
+            uploader: "Anonymous",
+            likeCount: 0,
+            dislikeCount: 0
           });
           resolve();
         } catch (error) {
@@ -257,6 +305,70 @@ const Room = () => {
       title: "Download started",
       description: `${photo.name} is being downloaded.`,
     });
+  };
+
+  const handleLikeDislike = async (photoId: string, action: "like" | "dislike") => {
+    try {
+      const photoRef = doc(db, "rooms", roomId!, "photos", photoId);
+      const likeRef = doc(db, "rooms", roomId!, "photos", photoId, "likes", userId);
+      
+      const likeDoc = await getDocRef(likeRef);
+      const photo = photos.find((p) => p.id === photoId);
+      if (!photo) return;
+
+      // If user already has an action
+      if (likeDoc.exists()) {
+        const currentAction = likeDoc.data().action;
+        if (currentAction === action) {
+          // Undo the action
+          await setDoc(likeRef, { action: null, timestamp: new Date() });
+          await updateDoc(photoRef, {
+            [action + "Count"]: increment(-1)
+          });
+          setPhotos(photos.map((p) =>
+            p.id === photoId ? { ...p, [action + "Count"]: p[action + "Count"] - 1, userAction: undefined } : p
+          ));
+          toast({
+            title: `Removed ${action}`,
+            description: `You removed your ${action} for ${photo.name}.`,
+          });
+        } else if (currentAction) {
+          // Switch from like to dislike or vice versa
+          await setDoc(likeRef, { action, timestamp: new Date() });
+          await updateDoc(photoRef, {
+            [currentAction + "Count"]: increment(-1),
+            [action + "Count"]: increment(1)
+          });
+          setPhotos(photos.map((p) =>
+            p.id === photoId ? { ...p, [currentAction + "Count"]: p[currentAction + "Count"] - 1, [action + "Count"]: p[action + "Count"] + 1, userAction: action } : p
+          ));
+          toast({
+            title: `Changed to ${action}`,
+            description: `You ${action}d ${photo.name}.`,
+          });
+        }
+      } else {
+        // New like/dislike
+        await setDoc(likeRef, { action, timestamp: new Date() });
+        await updateDoc(photoRef, {
+          [action + "Count"]: increment(1)
+        });
+        setPhotos(photos.map((p) =>
+          p.id === photoId ? { ...p, [action + "Count"]: p[action + "Count"] + 1, userAction: action } : p
+        ));
+        toast({
+          title: `${action.charAt(0).toUpperCase() + action.slice(1)}d`,
+          description: `You ${action}d ${photo.name}.`,
+        });
+      }
+    } catch (error) {
+      console.error(`Error ${action}ing photo:`, error);
+      toast({
+        title: `${action.charAt(0).toUpperCase() + action.slice(1)} failed`,
+        description: `Failed to ${action} the photo. Please try again.`,
+        variant: "destructive"
+      });
+    }
   };
 
   const shareRoom = () => {
@@ -414,9 +526,9 @@ const Room = () => {
                         variant="secondary"
                         size="icon"
                         className="opacity-0 group-hover:opacity-100 transition-opacity shadow-glow"
-                        onClick={() => downloadPhoto(photo)}
+                        onClick={() => setSelectedPhoto(photo)}
                       >
-                        <Download className="w-4 h-4" />
+                        <ZoomIn className="w-4 h-4" />
                       </Button>
                     </div>
                   </div>
@@ -444,6 +556,49 @@ const Room = () => {
           </div>
         )}
       </main>
+
+      {selectedPhoto && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-3xl w-full max-h-[90vh] overflow-auto">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-lg font-semibold">{selectedPhoto.name}</h2>
+              <Button variant="ghost" onClick={() => setSelectedPhoto(null)}>
+                Close
+              </Button>
+            </div>
+            <img
+              src={selectedPhoto.base64}
+              alt={selectedPhoto.name}
+              className="w-full max-h-[60vh] object-contain mb-4"
+            />
+            <div className="flex gap-4 justify-center">
+              <Button
+                variant="secondary"
+                onClick={() => downloadPhoto(selectedPhoto)}
+              >
+                <Download className="w-4 h-4 mr-2" />
+                Download
+              </Button>
+              <Button
+                variant={selectedPhoto.userAction === "like" ? "default" : "outline"}
+                onClick={() => handleLikeDislike(selectedPhoto.id, "like")}
+                disabled={uploading}
+              >
+                <ThumbsUp className="w-4 h-4 mr-2" />
+                Like ({selectedPhoto.likeCount})
+              </Button>
+              <Button
+                variant={selectedPhoto.userAction === "dislike" ? "default" : "outline"}
+                onClick={() => handleLikeDislike(selectedPhoto.id, "dislike")}
+                disabled={uploading}
+              >
+                <ThumbsDown className="w-4 h-4 mr-2" />
+                Dislike ({selectedPhoto.dislikeCount})
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
