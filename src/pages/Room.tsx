@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
 import { doc, getDoc, collection, addDoc, getDocs, query, orderBy, updateDoc, increment } from "firebase/firestore";
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { db, storage } from "@/lib/firebase";
+import { db } from "@/lib/firebase";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -29,7 +28,7 @@ interface RoomData {
 
 interface Photo {
   id: string;
-  url: string;
+  base64: string; // Store image as base64 string
   name: string;
   uploadedAt: Date;
   uploader?: string;
@@ -75,7 +74,6 @@ const Room = () => {
         photoCount: data.photoCount || 0
       };
 
-      // Check password for private rooms
       if (room.isPrivate) {
         const passwordAttempt = location.state?.passwordAttempt;
         if (passwordAttempt !== room.password) {
@@ -117,7 +115,7 @@ const Room = () => {
         const data = doc.data();
         photosList.push({
           id: doc.id,
-          url: data.url,
+          base64: data.base64,
           name: data.name,
           uploadedAt: data.uploadedAt.toDate(),
           uploader: data.uploader
@@ -139,6 +137,14 @@ const Room = () => {
 
     Array.from(files).forEach((file) => {
       if (file.type.startsWith("image/")) {
+        if (file.size > 750 * 1024) { // Check file size < 750KB to ensure base64 fits in 1MB
+          toast({
+            title: "File too large",
+            description: `${file.name} exceeds 750KB limit for Firestore storage.`,
+            variant: "destructive"
+          });
+          return;
+        }
         const uploadPromise = uploadPhoto(file);
         uploadPromises.push(uploadPromise);
       }
@@ -151,12 +157,10 @@ const Room = () => {
         description: "Your images have been added to the room.",
       });
       
-      // Update room photo count
       await updateDoc(doc(db, "rooms", roomId!), {
         photoCount: increment(uploadPromises.length)
       });
       
-      // Reload photos
       loadPhotos();
     } catch (error) {
       console.error("Error uploading photos:", error);
@@ -174,20 +178,24 @@ const Room = () => {
   };
 
   const uploadPhoto = async (file: File): Promise<void> => {
-    const timestamp = Date.now();
-    const fileName = `${timestamp}_${file.name}`;
-    const storageRef = ref(storage, `rooms/${roomId}/photos/${fileName}`);
-    
-    // Upload file to Firebase Storage
-    const snapshot = await uploadBytes(storageRef, file);
-    const downloadURL = await getDownloadURL(snapshot.ref);
-    
-    // Save photo metadata to Firestore
-    await addDoc(collection(db, "rooms", roomId!, "photos"), {
-      url: downloadURL,
-      name: file.name,
-      uploadedAt: new Date(),
-      uploader: "Anonymous" // You can implement user authentication later
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const base64 = reader.result as string;
+          await addDoc(collection(db, "rooms", roomId!, "photos"), {
+            base64,
+            name: file.name,
+            uploadedAt: new Date(),
+            uploader: "Anonymous" // Update with auth later if needed
+          });
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
+      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.readAsDataURL(file);
     });
   };
 
@@ -201,6 +209,14 @@ const Room = () => {
 
       files.forEach((file) => {
         if (file.type.startsWith("image/")) {
+          if (file.size > 750 * 1024) {
+            toast({
+              title: "File too large",
+              description: `${file.name} exceeds 750KB limit for Firestore storage.`,
+              variant: "destructive"
+            });
+            return;
+          }
           const uploadPromise = uploadPhoto(file);
           uploadPromises.push(uploadPromise);
         }
@@ -213,12 +229,10 @@ const Room = () => {
           description: "Your images have been added to the room.",
         });
         
-        // Update room photo count
         await updateDoc(doc(db, "rooms", roomId!), {
           photoCount: increment(uploadPromises.length)
         });
         
-        // Reload photos
         loadPhotos();
       } catch (error) {
         console.error("Error uploading photos:", error);
@@ -235,9 +249,8 @@ const Room = () => {
 
   const downloadPhoto = (photo: Photo) => {
     const link = document.createElement('a');
-    link.href = photo.url;
+    link.href = photo.base64;
     link.download = photo.name;
-    link.target = '_blank';
     link.click();
     
     toast({
@@ -281,7 +294,6 @@ const Room = () => {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="border-b bg-card shadow-soft">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
@@ -341,10 +353,8 @@ const Room = () => {
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="container mx-auto px-4 py-8">
         {photos.length === 0 ? (
-          // Empty State
           <div
             className="border-2 border-dashed border-muted rounded-3xl p-16 text-center transition-colors hover:border-primary/50"
             onDrop={handleDrop}
@@ -368,13 +378,11 @@ const Room = () => {
             </Button>
           </div>
         ) : (
-          // Photo Grid
           <div
             className="space-y-8"
             onDrop={handleDrop}
             onDragOver={(e) => e.preventDefault()}
           >
-            {/* Upload Zone */}
             <Card className="border-2 border-dashed border-muted hover:border-primary/50 transition-colors">
               <CardContent className="p-8 text-center">
                 <Upload className="w-8 h-8 text-muted-foreground mx-auto mb-4" />
@@ -391,18 +399,16 @@ const Room = () => {
               </CardContent>
             </Card>
 
-            {/* Photos Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
               {photos.map((photo) => (
                 <Card key={photo.id} className="overflow-hidden shadow-soft hover:shadow-elegant transition-shadow group">
                   <div className="relative aspect-square overflow-hidden">
                     <img 
-                      src={photo.url} 
+                      src={photo.base64} 
                       alt={photo.name}
                       className="w-full h-full object-cover transition-transform group-hover:scale-105"
                     />
                     
-                    {/* Overlay */}
                     <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors flex items-center justify-center">
                       <Button
                         variant="secondary"
