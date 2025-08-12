@@ -1,5 +1,8 @@
-import { useState, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
+import { doc, getDoc, collection, addDoc, getDocs, query, orderBy, updateDoc, increment } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { db, storage } from "@/lib/firebase";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +24,7 @@ interface RoomData {
   isPrivate: boolean;
   password?: string;
   id: string;
+  photoCount: number;
 }
 
 interface Photo {
@@ -37,96 +41,203 @@ const Room = () => {
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
   
-  // Get room data from navigation state or mock data
-  const roomData: RoomData = location.state || {
-    name: `Room ${roomId}`,
-    isPrivate: false,
-    id: roomId || "unknown"
+  const [roomData, setRoomData] = useState<RoomData | null>(null);
+  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+
+  useEffect(() => {
+    if (roomId) {
+      loadRoomData();
+    }
+  }, [roomId]);
+
+  const loadRoomData = async () => {
+    try {
+      const roomDoc = await getDoc(doc(db, "rooms", roomId!));
+      
+      if (!roomDoc.exists()) {
+        toast({
+          title: "Room not found",
+          description: "This room doesn't exist or has been deleted.",
+          variant: "destructive"
+        });
+        navigate("/");
+        return;
+      }
+
+      const data = roomDoc.data();
+      const room: RoomData = {
+        id: roomDoc.id,
+        name: data.name,
+        isPrivate: data.isPrivate,
+        password: data.password,
+        photoCount: data.photoCount || 0
+      };
+
+      // Check password for private rooms
+      if (room.isPrivate) {
+        const passwordAttempt = location.state?.passwordAttempt;
+        if (passwordAttempt !== room.password) {
+          toast({
+            title: "Incorrect password",
+            description: "The password you entered is incorrect.",
+            variant: "destructive"
+          });
+          navigate("/");
+          return;
+        }
+      }
+
+      setRoomData(room);
+      loadPhotos();
+    } catch (error) {
+      console.error("Error loading room:", error);
+      toast({
+        title: "Error",
+        description: "Failed to load room data",
+        variant: "destructive"
+      });
+      navigate("/");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  // Mock photos data - will be replaced with Supabase
-  const [photos, setPhotos] = useState<Photo[]>([
-    {
-      id: "1",
-      url: "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=400&h=400&fit=crop",
-      name: "beach-sunset.jpg",
-      uploadedAt: new Date(Date.now() - 3600000),
-      uploader: "Alex"
-    },
-    {
-      id: "2", 
-      url: "https://images.unsplash.com/photo-1469474968028-56623f02e42e?w=400&h=400&fit=crop",
-      name: "mountain-view.jpg",
-      uploadedAt: new Date(Date.now() - 7200000),
-      uploader: "Sarah"
-    },
-    {
-      id: "3",
-      url: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=400&h=400&fit=crop", 
-      name: "forest-path.jpg",
-      uploadedAt: new Date(Date.now() - 10800000),
-      uploader: "Mike"
+  const loadPhotos = async () => {
+    try {
+      const q = query(
+        collection(db, "rooms", roomId!, "photos"), 
+        orderBy("uploadedAt", "desc")
+      );
+      const querySnapshot = await getDocs(q);
+      const photosList: Photo[] = [];
+      
+      querySnapshot.forEach((doc) => {
+        const data = doc.data();
+        photosList.push({
+          id: doc.id,
+          url: data.url,
+          name: data.name,
+          uploadedAt: data.uploadedAt.toDate(),
+          uploader: data.uploader
+        });
+      });
+      
+      setPhotos(photosList);
+    } catch (error) {
+      console.error("Error loading photos:", error);
     }
-  ]);
+  };
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
-    if (!files) return;
+    if (!files || !roomData) return;
+
+    setUploading(true);
+    const uploadPromises: Promise<void>[] = [];
 
     Array.from(files).forEach((file) => {
       if (file.type.startsWith("image/")) {
-        const url = URL.createObjectURL(file);
-        const newPhoto: Photo = {
-          id: Date.now().toString() + Math.random(),
-          url,
-          name: file.name,
-          uploadedAt: new Date(),
-          uploader: "You"
-        };
-        
-        setPhotos(prev => [newPhoto, ...prev]);
-        toast({
-          title: "Photo uploaded!",
-          description: `${file.name} has been added to the room.`,
-        });
+        const uploadPromise = uploadPhoto(file);
+        uploadPromises.push(uploadPromise);
       }
     });
-    
-    // Reset input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
+
+    try {
+      await Promise.all(uploadPromises);
+      toast({
+        title: `${uploadPromises.length} photo(s) uploaded!`,
+        description: "Your images have been added to the room.",
+      });
+      
+      // Update room photo count
+      await updateDoc(doc(db, "rooms", roomId!), {
+        photoCount: increment(uploadPromises.length)
+      });
+      
+      // Reload photos
+      loadPhotos();
+    } catch (error) {
+      console.error("Error uploading photos:", error);
+      toast({
+        title: "Upload failed",
+        description: "Some photos failed to upload. Please try again.",
+        variant: "destructive"
+      });
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
     }
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const uploadPhoto = async (file: File): Promise<void> => {
+    const timestamp = Date.now();
+    const fileName = `${timestamp}_${file.name}`;
+    const storageRef = ref(storage, `rooms/${roomId}/photos/${fileName}`);
+    
+    // Upload file to Firebase Storage
+    const snapshot = await uploadBytes(storageRef, file);
+    const downloadURL = await getDownloadURL(snapshot.ref);
+    
+    // Save photo metadata to Firestore
+    await addDoc(collection(db, "rooms", roomId!, "photos"), {
+      url: downloadURL,
+      name: file.name,
+      uploadedAt: new Date(),
+      uploader: "Anonymous" // You can implement user authentication later
+    });
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     const files = Array.from(e.dataTransfer.files);
     
-    files.forEach((file) => {
-      if (file.type.startsWith("image/")) {
-        const url = URL.createObjectURL(file);
-        const newPhoto: Photo = {
-          id: Date.now().toString() + Math.random(),
-          url,
-          name: file.name,
-          uploadedAt: new Date(),
-          uploader: "You"
-        };
+    if (files.length > 0 && roomData) {
+      setUploading(true);
+      const uploadPromises: Promise<void>[] = [];
+
+      files.forEach((file) => {
+        if (file.type.startsWith("image/")) {
+          const uploadPromise = uploadPhoto(file);
+          uploadPromises.push(uploadPromise);
+        }
+      });
+
+      try {
+        await Promise.all(uploadPromises);
+        toast({
+          title: `${uploadPromises.length} photo(s) uploaded!`,
+          description: "Your images have been added to the room.",
+        });
         
-        setPhotos(prev => [newPhoto, ...prev]);
+        // Update room photo count
+        await updateDoc(doc(db, "rooms", roomId!), {
+          photoCount: increment(uploadPromises.length)
+        });
+        
+        // Reload photos
+        loadPhotos();
+      } catch (error) {
+        console.error("Error uploading photos:", error);
+        toast({
+          title: "Upload failed",
+          description: "Some photos failed to upload. Please try again.",
+          variant: "destructive"
+        });
+      } finally {
+        setUploading(false);
       }
-    });
-    
-    toast({
-      title: `${files.length} photo(s) uploaded!`,
-      description: "Your images have been added to the room.",
-    });
+    }
   };
 
   const downloadPhoto = (photo: Photo) => {
     const link = document.createElement('a');
     link.href = photo.url;
     link.download = photo.name;
+    link.target = '_blank';
     link.click();
     
     toast({
@@ -152,6 +263,21 @@ const Room = () => {
     const days = Math.floor(hours / 24);
     return `${days}d ago`;
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center">
+          <Camera className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+          <p className="text-muted-foreground">Loading room...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!roomData) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -190,7 +316,7 @@ const Room = () => {
             <div className="flex items-center gap-2">
               <Button variant="outline" onClick={shareRoom}>
                 <Share2 className="w-4 h-4 mr-2" />
-                Share Room
+                Share
               </Button>
               
               <input
@@ -205,9 +331,10 @@ const Room = () => {
               <Button 
                 variant="hero"
                 onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
               >
                 <Upload className="w-4 h-4 mr-2" />
-                Upload Photos
+                {uploading ? "Uploading..." : "Upload"}
               </Button>
             </div>
           </div>
@@ -226,7 +353,7 @@ const Room = () => {
             <div className="w-24 h-24 bg-gradient-accent rounded-full flex items-center justify-center mx-auto mb-6">
               <ImageIcon className="w-12 h-12 text-primary" />
             </div>
-            <h3 className="text-2xl font-semibold mb-4">No photos yet</h3>
+            <h3 className="text-2xl font-semibold mb-4">No images available</h3>
             <p className="text-muted-foreground mb-6 max-w-md mx-auto">
               Be the first to share! Drag and drop photos here or click the upload button to get started.
             </p>
@@ -234,6 +361,7 @@ const Room = () => {
               variant="hero" 
               size="lg"
               onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
             >
               <Plus className="w-5 h-5 mr-2" />
               Add First Photo
@@ -255,6 +383,7 @@ const Room = () => {
                   <button 
                     onClick={() => fileInputRef.current?.click()}
                     className="text-primary hover:underline font-medium"
+                    disabled={uploading}
                   >
                     click to upload
                   </button>
